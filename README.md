@@ -17,17 +17,64 @@ your app or gateway over BLE — no vendor lock-in, every line is yours to fork.
 
 ## Hardware
 
-Runs on the **Yakiot YAK-01** dev kit:
+The same firmware runs on two hardware setups — pick the one that fits you:
 
-- ESP32 + TWAI (CAN 2.0B) transceiver
-- OBD-II connector, **12V/24V input with load-dump protection** —
+### Option A — Plug-and-Play Commercial PCB
+
+The **Yakiot YAK-01** custom board:
+
+- ESP32
+- ATGM336H-5N multi-constellation GNSS
+- CA-IF1051VS CAN transceiver
+- Custom power regulator — **12V/24V input with load-dump protection**,
   safe on passenger cars and commercial truck networks
-- Multi-constellation GNSS, LTE Cat-M/NB-IoT, BLE
-- Buy: **https://yakiot.com** — $120 USD, no minimum order, volume pricing
-  from 10 units
+- OBD-II connector, BLE
+- Purchase the custom PCB at **https://yakiot.com**
 
-The firmware is plain ESP32 Arduino, so it also runs on generic
-ESP32 + CAN-transceiver boards for bench development.
+### Option B — DIY Breadboard Setup
+
+For bench development and experimentation:
+
+- ESP32 dev board
+- ATGM336H-5N GNSS module
+- SN65HVD230DR CAN transceiver module (3.3V)
+
+No automotive power front end on Option B — power it from USB on the bench
+and keep it off a running vehicle's 12V/24V rail.
+
+### Wiring
+
+GPS (ATGM336H-5N) to ESP32 — applies to both options:
+
+| ESP32 Pin     | GPS (ATGM336H-5N) Pins |
+| ------------- | ---------------------- |
+| 3.3V          | VCC 1                  |
+| GND           | GND 2                  |
+| GPIO 17 (RX2) | TX 3                   |
+| GPIO 16 (TX2) | RX 4                   |
+
+### SN65HVD230 to ESP32 (Transmitter)
+
+| ESP32 Pin | SN65HVD230 Pin |
+| --------- | -------------- |
+| 3.3V      | VCC            |
+| GND       | GND            |
+| GPIO 5    | CTX            |
+| GPIO 4    | CRX            |
+
+### OBD-II Connector to SN65HVD230
+
+| OBD-II Pin        | SN65HVD230 Pin |
+| ----------------- | -------------- |
+| PIN 4 (Chassis GND) | GND          |
+| PIN 6 (CAN H)     | CAN H          |
+| PIN 14 (CAN L)    | CAN L          |
+
+## Community
+
+Questions, builds, and fleet projects — join the **Yakiot Discord
+community**: https://discord.gg/rxyzHT9r2. You can also open an issue or
+discussion here on GitHub.
 
 ## Flashing
 

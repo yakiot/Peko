@@ -24,6 +24,7 @@ static uint32_t lastOdoNotify = 0;
 static uint32_t lastLoadNotify = 0;
 static uint32_t lastKeyNotify = 0;
 static uint32_t lastThrottleNotify = 0;
+static uint32_t lastPedalNotify = 0;
 static char vehicleVin[18] = {};
 static uint32_t lastVinNotify = 0;
 
@@ -370,11 +371,19 @@ void loop() {
         if (raw < 0xFA000000UL) publishMetric("odo", raw * 0.125f, lastOdoNotify);
         break;
       }
+      case 65266: {
+        if (rxFrame.data_length_code < 7 || rxFrame.data[6] > 250) break;
+        const float throttlePct = rxFrame.data[6] * 0.4f;
+        publishMetric("thr", throttlePct, lastThrottleNotify);
+        Serial.printf("   [DECODED] Throttle Position (SPN 51): %.1f %%\n", throttlePct);
+        break;
+      }
+
       case 61443: {  // EEC2 — Accelerator Pedal Position 1 (SPN 91, byte 2, 0.4%/bit) + Engine % Load (SPN 92, byte 3)
         if (rxFrame.data[1] <= 250) {
           float pedalPct = rxFrame.data[1] * 0.4f;
-          publishMetric("thr", pedalPct, lastThrottleNotify);
-          Serial.printf("   [DECODED] Throttle: %.1f %%\n", pedalPct);
+          publishMetric("pedal", pedalPct, lastPedalNotify);
+          Serial.printf("   [DECODED] Accelerator Pedal: %.1f %%\n", pedalPct);
         }
         if (rxFrame.data[2] <= 0xFA) {
           float loadPct = rxFrame.data[2] - 125.0f;
