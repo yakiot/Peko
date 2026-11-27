@@ -28,6 +28,7 @@ static uint32_t lastPedalNotify = 0;
 static char vehicleVin[18] = {};
 static uint32_t lastVinNotify = 0;
 
+// Validates a 17-byte VIN candidate (allowed charset only) and stores it in vehicleVin.
 static void acceptVin(const uint8_t* data, size_t length) {
   if (length < 17) return;
   for (size_t i = 0; i < 17; ++i) {
@@ -39,6 +40,7 @@ static void acceptVin(const uint8_t* data, size_t length) {
   vehicleVin[17] = '\0';
 }
 
+// Republishes the cached VIN as "v=<VIN>" every 5 s so reconnecting clients receive it.
 static void publishVin() {
   if (!vehicleVin[0] || !bleConnected.load() || millis() - lastVinNotify < 5000) return;
   lastVinNotify = millis();
@@ -48,6 +50,7 @@ static void publishVin() {
   telemetry->notify();
 }
 
+// GATT client connect/disconnect callbacks; flags are atomics consumed by the main loop.
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     bleConnected.store(true);
@@ -63,6 +66,8 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 static ServerCallbacks serverCallbacks;
 
+// Initializes the "Yak-ELD" GATT server: one service, one read/notify telemetry
+// characteristic with a CCCD, then starts advertising and logs the BLE address/UUIDs.
 static void startBle() {
   BLEDevice::init("Yak-ELD");
   BLEServer* server = BLEDevice::createServer();
@@ -81,6 +86,7 @@ static void startBle() {
   Serial.printf("BLE service: %s\nBLE telemetry: %s\n", SERVICE_UUID, TELEMETRY_UUID);
 }
 
+// Publishes "name=value" as a BLE notification, throttled to one per 200 ms per metric.
 static void publishMetric(const char* name, float value, uint32_t& lastNotify) {
   if (!bleConnected.load() || millis() - lastNotify < 200) return;
   lastNotify = millis();
@@ -94,8 +100,100 @@ static void publishMetric(const char* name, float value, uint32_t& lastNotify) {
 #define CAN_TX 5
 #define CAN_RX 4
 
+// ATGM336H-5N GPS on UART2: RX2 = GPIO16, TX2 = GPIO17, 9600 baud NMEA
+#define GPS_RX 16
+#define GPS_TX 17
+
 CanFrame rxFrame;
 static bool canReady = false;
+
+static char nmeaLine[96];
+static size_t nmeaLen = 0;
+static uint32_t lastGpsNotify = 0;
+static uint32_t nmeaSentences = 0;
+static uint32_t nmeaRmcInvalid = 0;
+static uint32_t lastGpsByteAt = 0;
+static uint32_t lastGpsFixAt = 0;
+static uint32_t lastGpsStatusLog = 0;
+
+// Converts NMEA ddmm.mmmm / dddmm.mmmm to decimal degrees; S/W hemispheres are negative.
+// Sends a CASIC config command to the ATGM336H: "$<body>*<xor-checksum>\r\n".
+// Requires the module RX line wired to TX2 (GPIO17).
+static void sendGpsCommand(const char* body) {
+  uint8_t checksum = 0;
+  for (const char* p = body; *p; ++p) checksum ^= uint8_t(*p);
+  Serial2.printf("$%s*%02X\r\n", body, checksum);
+}
+
+static float nmeaToDegrees(const char* raw, char hemi) {
+  if (!raw[0]) return 0.0f;
+  const float v = atof(raw);
+  const int deg = int(v / 100);
+  float out = deg + (v - deg * 100) / 60.0f;
+  if (hemi == 'S' || hemi == 'W') out = -out;
+  return out;
+}
+
+// Parses one complete NMEA sentence. Only $GxRMC is used: requires status 'A' (valid fix),
+// logs the position and publishes "g=<lat>,<lon>" throttled to 1 Hz.
+static void handleNmea(char* s) {
+  const size_t n = strlen(s);
+  if (n < 20 || s[0] != '$' || strncmp(s + 3, "RMC", 3) != 0) return;
+  char* f[12] = {};
+  int count = 0;
+  for (char* t = strtok(s, ","); t && count < 12; t = strtok(nullptr, ",")) f[count++] = t;
+  if (count < 7) return;
+  if (f[2][0] != 'A') {
+    nmeaRmcInvalid++;
+    if (GPS_DEBUG) Serial.println("   [GPS] RMC received but fix invalid (no satellite lock)");
+    return;
+  }
+  const float lat = nmeaToDegrees(f[3], f[4][0]);
+  const float lon = nmeaToDegrees(f[5], f[6][0]);
+  if (lat == 0.0f && lon == 0.0f) {
+    nmeaRmcInvalid++;
+    if (GPS_DEBUG) Serial.println("   [GPS] RMC has empty coordinates");
+    return;
+  }
+  lastGpsFixAt = millis();
+  Serial.printf("   [GPS] %.5f, %.5f\n", lat, lon);
+  if (!bleConnected.load() || millis() - lastGpsNotify < 1000) return;
+  lastGpsNotify = millis();
+  char payload[20];
+  snprintf(payload, sizeof(payload), "g=%.4f,%.4f", lat, lon);
+  telemetry->setValue(payload);
+  telemetry->notify();
+}
+
+// Drains the UART2 RX buffer into nmeaLine; complete lines go to handleNmea().
+// Called once per loop tick, so the UART buffer must hold a full second of NMEA.
+static void pollGps() {
+  while (Serial2.available()) {
+    const char c = (char)Serial2.read();
+    lastGpsByteAt = millis();
+    if (c == '\n') {
+      nmeaLine[nmeaLen] = '\0';
+      nmeaSentences++;
+      handleNmea(nmeaLine);
+      nmeaLen = 0;
+    } else if (c != '\r') {
+      if (nmeaLen < sizeof(nmeaLine) - 1) nmeaLine[nmeaLen++] = c;
+      else nmeaLen = 0;
+    }
+  }
+  if (!GPS_DEBUG) return;
+  const uint32_t now = millis();
+  if (now - lastGpsStatusLog < 10000) return;
+  lastGpsStatusLog = now;
+  if (!lastGpsByteAt) {
+    Serial.println("   [GPS] no UART data — check wiring (RX2=GPIO16 to module TX)");
+  } else if (!lastGpsFixAt) {
+    Serial.printf("   [GPS] %lu sentences, no valid fix yet (module alive, acquiring satellites?)\n",
+                  (unsigned long)nmeaSentences);
+  } else if (now - lastGpsFixAt > 10000) {
+    Serial.printf("   [GPS] last fix %lu s ago\n", (unsigned long)((now - lastGpsFixAt) / 1000));
+  }
+}
 
 #ifdef PROTOCOL_OBD2
 static uint16_t obdEcu = 0;
@@ -117,14 +215,17 @@ static size_t isoReceived = 0;
 static uint8_t isoSequence = 1;
 static uint32_t isoAt = 0;
 
+// Decodes a big-endian uint32 from 4 bytes (OBD-II multi-byte fields).
 static uint32_t bigEndian32(const uint8_t* bytes) {
   return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
          (uint32_t(bytes[2]) << 8) | bytes[3];
 }
 
+// Handles a complete OBD-II response payload: supported-PID discovery, VIN assembly
+// result, and Mode 01 metrics (RPM, speed, throttle, fuel, odometer) -> BLE.
 static void finishObd(const uint8_t* data, size_t length, uint16_t source) {
   if (length >= 3 && data[0] == 0x7F && data[1] == pendingMode) {
-    Serial.printf("OBD-II negative response mode=%02X code=%02X\n", pendingMode, data[2]);
+    if (CAN_DEBUG) Serial.printf("OBD-II negative response mode=%02X code=%02X\n", pendingMode, data[2]);
     return;
   }
   if (length < 2 || data[0] != pendingMode + 0x40 || data[1] != pendingPid) return;
@@ -160,12 +261,15 @@ static void finishObd(const uint8_t* data, size_t length, uint16_t source) {
   isoLength = 0;
 }
 
+// Schedules the next OBD-II request: discovers supported PIDs first, then RPM/speed
+// ~1 Hz and a rotating aux slot (fuel / odometer / throttle / VIN) every 1.5 s.
+// One outstanding request at a time with response timeouts.
 static void pollObd() {
   const uint32_t now = millis();
   if (pendingMode) {
     if (now - requestSentAt < (isoLength ? 1000UL : 250UL) &&
         (!isoLength || now - isoAt < 250)) return;
-    Serial.printf("OBD-II timeout mode=%02X pid=%02X\n", pendingMode, pendingPid);
+    if (CAN_DEBUG) Serial.printf("OBD-II timeout mode=%02X pid=%02X\n", pendingMode, pendingPid);
     pendingMode = 0;
     isoLength = 0;
   }
@@ -195,7 +299,7 @@ static void pollObd() {
   request.data[2] = pid;
   lastObdRequest = now;
   if (!ESP32Can.writeFrame(request)) {
-    Serial.println("OBD-II CAN transmit failed");
+    if (CAN_DEBUG) Serial.println("OBD-II CAN transmit failed");
     return;
   }
   if (pid == 0x0C && mode == 1) lastRpmRequest = now;
@@ -205,6 +309,9 @@ static void pollObd() {
   requestSentAt = now;
 }
 
+// Filters an incoming CAN frame as an OBD-II response (0x7E8-0x7EF) and dispatches
+// single-frame replies, ISO-TP first frames (sends flow control), and consecutive
+// frames during VIN assembly.
 static void receiveObd(const CanFrame& frame) {
   if (frame.extd || frame.rtr || frame.identifier < 0x7E8 || frame.identifier > 0x7EF ||
       (obdEcu && frame.identifier != obdEcu) || frame.data_length_code < 2 ||
@@ -251,6 +358,8 @@ static size_t vinLength = 0;
 static size_t vinReceived = 0;
 static uint32_t vinAt = 0;
 
+// Passively assembles a J1939 VIN from broadcast TP.CM BAM (0xEC00) announcements
+// and TP.DT (0xEB00) data frames targeting PGN 0xFEEC.
 static void receiveJ1939Vin(uint32_t pgn, const CanFrame& frame) {
   const uint8_t source = frame.identifier & 0xFF;
   const uint8_t destination = (frame.identifier >> 8) & 0xFF;
@@ -278,6 +387,8 @@ static void receiveJ1939Vin(uint32_t pgn, const CanFrame& frame) {
 }
 #endif
 
+// Brings up serial logging, BLE GATT server + advertising, the TWAI/CAN driver
+// (250 kbps J1939 or 500 kbps OBD-II), and the GPS UART2 receiver.
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -293,8 +404,18 @@ void setup() {
   if (canReady) Serial.println("OBD-II polling ready: 500kbps, 11-bit, Mode 01 RPM/speed");
 #endif
   if (!canReady) Serial.println("CAN Init Failed!");
+
+  Serial2.setRxBufferSize(1024);
+  Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  // Default output includes GGA/GLL/GSA/GSV/VTG (~800+ bytes per fix) and can
+  // overflow the UART buffer at the 1 s loop cadence. Keep RMC only, 1 Hz.
+  sendGpsCommand("PCAS03,0,0,0,0,1,0,0,0,0,0,,,0,0");
+  Serial.println("GPS UART2 ready at 9600 baud (RX2=16, TX2=17)");
 }
 
+// Runs once per LOOP_INTERVAL_S: restarts BLE advertising after disconnects,
+// republishes the cached VIN, drains GPS UART2, polls OBD-II requests, then drains
+// the CAN RX queue and decodes J1939 PGNs / OBD-II responses.
 void loop() {
   static uint32_t lastLoopRun = 0;
   const uint32_t now = millis();
@@ -303,15 +424,16 @@ void loop() {
 
   if (restartAdvertising.exchange(false)) BLEDevice::startAdvertising();
   publishVin();
+  pollGps();
   if (!canReady) { delay(10); return; }
+  // Drain the CAN queue BEFORE pollObd(): replies arrive ~50 ms after a request
+  // but sit in the queue until this 1 s tick. Draining first lets receiveObd()
+  // accept them while pendingMode is still set; pollObd() then times out only
+  // requests that truly got no response.
 #ifdef PROTOCOL_OBD2
-  pollObd();
-#endif
-  // Drain all queued CAN frames each cycle; readFrame returns immediately when empty.
-  while (ESP32Can.readFrame(rxFrame, CAN_READ_TIMEOUT_MS)) {
-#ifdef PROTOCOL_OBD2
-    receiveObd(rxFrame);
+  while (ESP32Can.readFrame(rxFrame, CAN_READ_TIMEOUT_MS)) receiveObd(rxFrame);
 #else
+  while (ESP32Can.readFrame(rxFrame, CAN_READ_TIMEOUT_MS)) {
     if (!rxFrame.extd || rxFrame.rtr || rxFrame.data_length_code > 8) return;
     // 1. Extract PGN (Bits 8-25 of the 29-bit ID)
     uint32_t pgn = (rxFrame.identifier >> 8) & 0x3FFFF;
@@ -422,6 +544,9 @@ void loop() {
         break;
       }
     }
-#endif
   }
+#endif
+#ifdef PROTOCOL_OBD2
+  pollObd();
+#endif
 }

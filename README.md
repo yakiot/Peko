@@ -48,10 +48,10 @@ GPS (ATGM336H-5N) to ESP32 — applies to both options:
 
 | ESP32 Pin     | GPS (ATGM336H-5N) Pins |
 | ------------- | ---------------------- |
-| 3.3V          | VCC 1                  |
-| GND           | GND 2                  |
-| GPIO 17 (RX2) | TX 3                   |
-| GPIO 16 (TX2) | RX 4                   |
+| 3.3V          | VCC                   |
+| GND           | GND                   |
+| GPIO 17 (TX2) | RX                    |
+| GPIO 16 (RX2) | TX                   |
 
 ### SN65HVD230 to ESP32 (Transmitter)
 
